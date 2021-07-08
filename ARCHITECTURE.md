@@ -136,17 +136,140 @@ It contains:
   - `Outcome`: like a `kotlin.Result`, it represents an outcome that can be successful (`Outcome.success(obj)`) or a failure (`Outcome.failure(throwable)`). But unlike `Result`, `Outcome` can be returned by functions. It is used mainly to call web services.
   - `Dates.kt`: date parsing
 
-#### MVVM: `view(viewmodel(model)))`
-
-TODO
 
 #### Data `Flow`ing through functions
 
-TODO
+TODO (see AutosuggestViewModel)
 
 #### Taking out effects
 
-TODO
+When starting this experiment, I had the idea of this function: `process(inputFlow: Flow<Input>): Flow<Output>`. It would be the heart of a `ViewModel` and would not depend on anything other than the `Flow` API, `Input` and `Output` data classes.
+
+The `process()` top level function would have **no side effect**. For example instead of fetching data in a repository by calling `repository.findById(id)`, it would describe the "fetch" effect and let it be emitted to an output `Flow`: `Output.FetchData(id)`. 
+
+The actual effects would be handled by methods in the `ViewModel`. These methods would be "normal" imperative code: it would have dependencies on the Android SDK, the data layer, web services, etc.
+
+As an example, here is the code in `RoadmapViewModel.kt`. Keep in mind that `process` is a top level function, not a method of `RoadmapViewModel`.
+
+```kotlin
+private sealed class Input {
+    object Default : Input()
+    data class Start(val tripId: String) : Input()
+    data class TripRecalled(val id: String, val journey: Journey?) : Input()
+}
+
+private sealed class Output {
+    data class RecallTrip(val tripId: String) : Output()
+    data class ChangeState(val journeyOutcome: Outcome<Journey>) : Output()
+}
+
+private fun process(inputFlow: Flow<Input>): Flow<Output> = merge(
+
+    // Start ⇒ recall trip
+    inputFlow.filterIsInstance<Input.Start>()
+        .map {
+            val tripId = it.tripId
+            Output.RecallTrip(tripId)
+        },
+
+    // Trip recalled ⇒ change state
+    inputFlow.filterIsInstance<Input.TripRecalled>()
+        .map { recalled ->
+            val trip = recalled.journey
+            val tripId = recalled.id
+            val outcome = if (trip == null) {
+                Outcome.Failure(Exception("Trip not found: $tripId"))
+            } else {
+                Outcome.Success(trip)
+            }
+            Output.ChangeState(outcome)
+        }
+)
+```
+
+The idea behind this code is that all the intelligence ("decisions" or "logic") of the `ViewModel` is implemented in the `process` function. The `ViewModel`'s role is to send `Input`s to `process()` and then apply effects based on its `Output`s.
+
+The beauty of this approach is that the `Input`s could be anything like geolocation updates, user steps (as in a podometer), microphone data, or any sensor input... The `Output`s could represent any effect like displaying information on the screen, playing audio, logging an error, or even triggering a robotic arm. 
+
+Whatever device capabilities or SDKs the app is using, the `process` method would only manipulate kotlin `Flow`s, `Input`s or `Output`s. Is `process` a pure function? I don't think so, because `Flows` can have state or be impure themselves. But `Flow`s are a way to abstract your dependencies and use them without coupling.
+
+How does it work? It all starts in `RoadmapViewModel` when the output Flow is initialized:
+
+```kotlin
+private val outputFlow: Flow<Output> = process(inputFlow)
+```
+
+Then the ViewModel sets up effect handlers:
+
+```kotlin
+init {
+    outputFlow.onEach {
+        processOutput(it)
+    }.launchIn(viewModelScope)
+}
+
+private fun processOutput(output: Output) {
+    when (output) {
+        is Output.RecallTrip -> recallTrip(output.tripId)
+        is Output.ChangeState -> changeState(output.journeyOutcome)
+    }
+}
+
+private fun recallTrip(tripId: String) {
+    val recalled = journeyCache.get(tripId)
+    inputFlow.value = Input.TripRecalled(tripId, recalled)
+}
+
+private fun changeState(journeyOutcome: Outcome<Journey>) {
+    _state.value = State(journeyOutcome)
+}
+```
+
+And then `RoadmapFragment` loads the initial data:
+
+```kotlin
+override fun onActivityCreated(savedInstanceState: Bundle?) {
+    super.onActivityCreated(savedInstanceState)
+    val args = arguments
+        ?.let { RoadmapFragmentArgs.fromBundle(it) }
+        ?: throw IllegalArgumentException("Invalid arguments: $arguments")
+    viewModel.load(args.tripId)
+}
+```
+
+And here is `RoadmapViewModel.load()`. It sends an `Input.Start`:
+
+```kotlin
+fun load(tripId: String) {
+    inputFlow.value = Input.Start(tripId)
+}
+```
+
+So, what's the result of this experiment about implementing all the intelligence in the `process` function?
+
+In `RoadmapViewModel`, the code seems alright. But let's imagine the equivalent "usual" code:
+
+```kotlin
+fun load(tripId: String) {
+    // Start(tripId)
+    // Recall(tripId)
+    val recalled = journeyCache.get(tripId)
+    // TripRecalled(tripId, recalled)
+    val trip = recalled.journey
+    val tripId = recalled.id
+    val outcome = if (trip == null) {
+        Outcome.Failure(Exception("Trip not found: $tripId"))
+    } else {
+        Outcome.Success(trip)
+    }
+    // Output.ChangeState(outcome)
+    _state.value = State(journeyOutcome)
+}
+```
+
+😅
+
+The experiment should be conducted in a more complex use case, but I have the intuition that it would not be worth it. Perhaps when the app has to interact with many third party SDKs or frameworks? I don't know.
 
 #### What next?
 
